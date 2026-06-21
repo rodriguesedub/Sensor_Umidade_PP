@@ -1,6 +1,6 @@
 # Controle Automático de Exaustor por Umidade
 
-Firmware para controle automatizado de exaustor baseado no microcontrolador Arduino e no sensor de umidade DHT22. O sistema utiliza arquitetura não-bloqueante (`millis()`) e opera através de uma máquina de estados controlada por flags e temporizadores globais.
+Firmware para controle automatizado de exaustor baseado no microcontrolador Arduino nano e no sensor de umidade DHT22. O sistema utiliza arquitetura não-bloqueante (`millis()`) e opera através de uma máquina de estados controlada por flags e temporizadores globais.
 
 ---
 
