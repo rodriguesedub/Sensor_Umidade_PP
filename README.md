@@ -9,7 +9,7 @@ Firmware para controle automatizado de exaustor baseado no microcontrolador Ardu
 O sistema lê dinamicamente a configuração física das chaves seletoras de hardware através da função `lerAlvo()`. A tabela abaixo define os níveis de acionamento e desligamento:
 
 | Estado do Hardware | Nível Correspondente | Umidade Alvo de Acionamento | Regra de Desligamento (Histerese de 5%) |
-| :--- | :--- | :--- | :--- |
+| --- | --- | --- | --- |
 | Nenhum pino aterrado | UMID_NIVEL0 (Padrão) | 70.00% | Umidade <= 65.0% |
 | Pino D4 em GND | UMID_NIVEL1 | 60.00% | Umidade <= 55.0% |
 | Pino D3 em GND | UMID_NIVEL2 | 50.00% | Umidade <= 45.0% |
@@ -23,30 +23,44 @@ O sistema lê dinamicamente a configuração física das chaves seletoras de har
 O sistema opera através de uma máquina de cinco estados lógicos principais:
 
 ### Estado 1: Monitoramento (Standby)
+
 * **Comportamento:** O exaustor permanece desligado (`exaustorLigado = false`).
 * **Ação:** Realiza leituras contínuas do sensor e compara os valores com o alvo configurado.
-* **Transição:** Caso a umidade atinja ou ultrapasse o alvo e o sistema não esteja bloqueado, transiciona automaticamente para o estado de Exaustão Ativa.
+* **Transição:** Caso a umidade atinja ou ultrapasse o alvo e o sistema não esteja no ciclo de chuva, transiciona automaticamente para o estado de Exaustão Ativa.
 
 ### Estado 2: Exaustão Ativa
+
 * **Comportamento:** O relé é acionado.
-* **Ação:** Garante que o motor funcione por um tempo mínimo de 30 segundos (`T_MIN_ON`). 
-* **Condições de Parada:** Após o tempo mínimo, o sistema avalia se a umidade retornou ao alvo (respeitando a histerese de 5%) ou se o tempo máximo de operação de 30 minutos (`T_MAX_ON`) foi atingido.
+* **Ação:** Garante que o motor funcione por um tempo mínimo de 30 segundos (`T_MIN_ON`).
+* **Condições de Parada:** Após o tempo mínimo, o sistema desliga se a umidade retornar ao alvo (respeitando a histerese). Se o sistema atingir o tempo máximo de operação contínua de 30 minutos (`T_MAX_ON`), ele avalia a necessidade de entrar no Modo Clima Saturado ou apenas realizar um Cooldown.
 
-### Estado 3: Detecção de Piso Ambiente
-* **Comportamento:** Atua em paralelo à exaustão ativa como medida preventiva para condições climáticas saturadas (ex: dias de chuva).
-* **Ação:** Após 5 minutos com o exaustor ligado (`T_VERIFICA_QUEDA`), o sistema verifica se a umidade caiu pelo menos 3% (`QUEDA_MINIMA`).
-* **Bloqueio:** Se esta queda não ocorrer, o sistema força o desligamento do exaustor, ativa a flag `bloqueioUmidade = true` e registra a leitura atual na variável `pisoBloqueio`.
+### Estado 3: Modo Clima Saturado (Rotina de Chuva)
 
-### Estado 4: Desbloqueio e Cooldown
-* **Condições de Desbloqueio:** O bloqueio por umidade ambiente é desfeito se:
-  1. A umidade cair 1% naturalmente abaixo do `pisoBloqueio`.
-  2. A umidade sofrer uma elevação abrupta de 3% (indicação de novo banho no local).
-  3. A umidade cair abaixo do nível alvo original.
-* **Cooldown:** Se o exaustor atingir o tempo máximo de operação de 30 minutos no estado de exaustão, o sistema entra em repouso forçado por 2 minutos (`T_COOLDOWN`) antes de permitir um novo acionamento do motor.
+* **Comportamento:** Atua como medida preventiva para evitar que o exaustor fique ligado infinitamente em dias de chuva, garantindo ventilação de respiro para não abafar o ambiente.
+* **Ação (Gatilho):** Ao bater 30 minutos de exaustão contínua, o sistema verifica se a umidade caiu pelo menos 3% (`QUEDA_MINIMA`). Se não caiu, ele entende que o clima externo está úmido e ativa a flag `modoSaturado = true`, gravando o nível atual em `pisoBloqueio`.
+* **Ciclo Progressivo (`passoSaturado`):** Uma máquina de estados interna executa o seguinte ciclo de respiro intermitente:
+* **Passo 1:** Pausa de 15 minutos.
+* **Passo 2:** Liga por 15 minutos.
+* **Passo 3:** Pausa de 30 minutos.
+* **Passo 4:** Liga por 7 minutos.
+* **Passo 5:** Pausa de 1 hora (ao fim desta pausa, o sistema retorna ao Passo 4 em loop infinito até que o clima mude).
+
+
+
+### Estado 4: Saída do Modo Saturado e Cooldown
+
+* **Condições de Saída (Abortar Ciclo de Chuva):** O bloqueio do ciclo saturado é imediatamente desfeito (retornando ao controle normal) se ocorrer uma das seguintes situações:
+* O ar secou naturalmente 1% abaixo do piso gravado (`QUEDA_DESBLOQUEIO`).
+* A umidade sofreu uma elevação abrupta de 3% acima do piso (`PICO_DESBLOQUEIO`), indicando um novo banho no local.
+* A umidade despencou abaixo do alvo original.
+
+
+* **Cooldown de Segurança:** Se o exaustor trabalhou os 30 minutos do Estado 2 com sucesso (a umidade caiu bem, mas não atingiu o alvo final), o motor é desligado à força por 2 minutos (`T_COOLDOWN`) para esfriar antes de retomar a exaustão.
 
 ### Estado 5: Fallback de Erro (Safe Mode)
+
 * **Comportamento:** Camada de redundância ativada quando o sensor para de responder e a variável `falhasSeguidas` atinge o limite máximo (`MAX_FALHAS = 5`), alterando a flag `sensorOk` para `false`.
-* **Ação:** O sistema adota um ciclo cego de 30 minutos ligado e 30 minutos desligado (`T_ERRO_CICLO`) para garantir a ventilação contínua do ambiente (tratamento comum para falhas causadas por condensação no leitor).
+* **Ação:** O sistema adota um ciclo cego de 30 minutos ligado e 30 minutos desligado (`T_ERRO_CICLO`) para garantir a ventilação contínua do ambiente (tratamento comum para falhas causadas por condensação severa no leitor).
 * **Retorno:** Assim que o sensor volta a enviar leituras estáveis, o estado de emergência é cancelado e a operação normal é retomada instantaneamente.
 
 ---
