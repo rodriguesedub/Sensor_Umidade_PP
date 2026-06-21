@@ -5,7 +5,7 @@
    - Le umidade (DHT22) e aciona o exaustor via rele
    - 3 niveis de sensibilidade via chave seletora
    - Histerese (anti-chattering) + tempo min/max ligado
-   - Deteccao de piso ambiente: desliga se a umidade nao cair
+   - Rotina de Clima Saturado: Ciclos progressivos de respiro
    - Fallback de Erro: Ciclo de 30 min ON / 30 min OFF
    - Arquitetura nao-bloqueante (millis), sem delay no loop
    ========================================================= */
@@ -28,22 +28,30 @@ const float UMID_NIVEL2 = 50.0;  // GND no D3
 // ---- Parametros de controle padrão ----
 const float         HISTERESE          = 5.0;        // desliga 5% abaixo do alvo
 const unsigned long T_MIN_ON           = 30000UL;    // 30 s minimo ligado
-const unsigned long T_MAX_ON           = 1800000UL;  // 30 min maximo ligado
-const unsigned long T_COOLDOWN         = 120000UL;   // 2 min de descanso
+const unsigned long T_MAX_ON           = 1800000UL;  // 30 min maximo ligado (teste de saturação)
+const unsigned long T_COOLDOWN         = 120000UL;   // 2 min de descanso (uso normal)
 const unsigned long INTERVALO_LEITURA  = 2500UL;     // >= 2 s entre leituras (DHT22)
 const unsigned long INTERVALO_PISCA    = 250UL;      // pisca do LED em caso de falha
 const uint8_t       MAX_FALHAS         = 5;          // falhas seguidas p/ declarar defeito
 
-// ---- Novos Parametros: Piso Ambiente e Erro ----
-const unsigned long T_VERIFICA_QUEDA   = 300000UL;   // 5 min (tempo para testar se a umidade cai)
-const float         QUEDA_MINIMA       = 3.0;        // Exige 3% de queda no tempo acima
-const float         QUEDA_DESBLOQUEIO  = 1.0;        // Caiu 1% abaixo do piso? Voltou a secar (desbloqueia)
-const float         PICO_DESBLOQUEIO   = 3.0;        // Subiu 3% acima do piso? Novo banho (desbloqueia)
+// ---- Novos Parametros: Piso Ambiente e Ciclo Saturado ----
+const float         QUEDA_MINIMA       = 3.0;        // Exige 3% de queda apos 30 min, senao ativa ciclo saturado
+const float         QUEDA_DESBLOQUEIO  = 1.0;        // Caiu 1% abaixo do piso? Voltou a secar (sai do ciclo)
+const float         PICO_DESBLOQUEIO   = 3.0;        // Subiu 3% acima do piso? Novo banho (sai do ciclo)
+
+// Tempos da Máquina de Estados (Modo Saturado / Chuva)
+const unsigned long T_SAT_PAUSA1       = 900000UL;   // 15 min parado
+const unsigned long T_SAT_LIGA1        = 900000UL;   // 15 min funcionando
+const unsigned long T_SAT_PAUSA2       = 1800000UL;  // 30 min parado
+const unsigned long T_SAT_LIGA2        = 420000UL;   // 7 min funcionando
+const unsigned long T_SAT_PAUSA3       = 3600000UL;  // 1 h parado
+
+// ---- Tempo de Erro do Sensor ----
 const unsigned long T_ERRO_CICLO       = 1800000UL;  // 30 min ON / 30 min OFF no modo de erro
 
 DHT dht(DHTPIN, DHTTYPE);
 
-// ---- Estado do Sistema ----
+// ---- Estado Geral do Sistema ----
 bool     exaustorLigado = false;
 bool     sensorOk       = true;   
 uint8_t  falhasSeguidas = 0;
@@ -55,15 +63,16 @@ unsigned long tFimCooldown   = 0;
 unsigned long tUltimoPisca   = 0;
 bool          ledEstado      = true;
 
-// ---- Estados: Piso de Umidade Ambiente ----
-float umidadeAoLigar  = 0.0;
-bool  verificouQueda  = false;
-bool  bloqueioUmidade = false; // true = desistiu de secar (umidade ambiente alta)
-float pisoBloqueio    = 0.0;   // guarda o valor em que travou
+// ---- Estados: Ciclo de Clima Saturado ----
+float         umidadeAoLigar = 0.0;
+bool          modoSaturado   = false; // true = entrou na rotina de chuva
+uint8_t       passoSaturado  = 0;     // rastreia qual etapa do ciclo está rodando
+unsigned long tInicioPasso   = 0;     // cronometro do passo atual
+float         pisoBloqueio   = 0.0;   // guarda a umidade de quando o modo saturado começou
 
 // ---- Estados: Fallback de Erro ----
-bool  erroIniciado = false;
-unsigned long tInicioErro = 0;
+bool          erroIniciado   = false;
+unsigned long tInicioErro    = 0;
 
 // ---- Helpers ----
 void setRele(bool ligar) {
@@ -131,7 +140,11 @@ void loop() {
     if (sensorOk) Serial.print(ultimaUmidade); else Serial.print("FALHA");
     Serial.print(" | Alvo: ");      Serial.print(lerAlvo());
     Serial.print(" | Exaustor: ");  Serial.print(exaustorLigado ? "ON" : "OFF");
-    if (bloqueioUmidade) Serial.print(" [BLOQUEADO POR AMBIENTE]");
+    if (modoSaturado) {
+      Serial.print(" [SATURADO: Passo ");
+      Serial.print(passoSaturado);
+      Serial.print("]");
+    }
     Serial.println();
 #endif
   }
@@ -142,80 +155,103 @@ void loop() {
   if (!sensorOk) {
     if (!erroIniciado) {
       erroIniciado = true;
-      setRele(true); // Começa o ciclo ligado para garantir extração imediata
+      setRele(true); 
       tInicioErro = agora;
     }
-    // A cada 30 minutos, inverte o estado
     if (agora - tInicioErro >= T_ERRO_CICLO) {
       tInicioErro = agora;
       setRele(!exaustorLigado);
     }
-    return; // Interrompe a logica normal aqui
+    return; // Interrompe a logica normal
   } else {
-    // Caso o sensor volte a funcionar, limpa a flag de erro e reinicia normal
     if (erroIniciado) {
       erroIniciado = false;
       setRele(false);
       tFimCooldown = 0;
-      bloqueioUmidade = false;
+      modoSaturado = false;
     }
   }
 
   // ========================================================
-  // 2. LOGICA DE CONTROLE NORMAL (COM DETECÇÃO DE PISO)
+  // 2. LOGICA DE CONTROLE NORMAL E CICLO SATURADO
   // ========================================================
   float alvo = lerAlvo();
 
-  // Tratamento de Desbloqueio: 
-  // O exaustor parou por "piso ambiente". Ele volta se:
-  // 1. O clima secou naturalmente (caiu 1% do piso)
-  // 2. Alguém tomou outro banho (subiu 3% do piso)
-  // 3. A umidade despencou abaixo do alvo
-  if (bloqueioUmidade) {
+  // Tratamento de Saída do Modo Saturado:
+  // Se o ar secar naturalmente (caiu do piso), bater o alvo original, ou 
+  // alguem tomar um novo banho (pico de umidade), ele aborta o ciclo.
+  if (modoSaturado) {
     if (ultimaUmidade <= pisoBloqueio - QUEDA_DESBLOQUEIO ||
         ultimaUmidade >= pisoBloqueio + PICO_DESBLOQUEIO  ||
         ultimaUmidade <= alvo) {
-      bloqueioUmidade = false; 
+      
+      modoSaturado = false;
+      passoSaturado = 0;
+      setRele(false); // Desliga para avaliar as condicoes normais
+      
+    } else {
+      // Máquina de estados do ciclo progressivo
+      unsigned long tempoNoPasso = agora - tInicioPasso;
+      
+      switch(passoSaturado) {
+        case 1: // Pausa 15 min
+          if (tempoNoPasso >= T_SAT_PAUSA1) { passoSaturado = 2; tInicioPasso = agora; setRele(true); }
+          break;
+        case 2: // Liga 15 min
+          if (tempoNoPasso >= T_SAT_LIGA1)  { passoSaturado = 3; tInicioPasso = agora; setRele(false); }
+          break;
+        case 3: // Pausa 30 min
+          if (tempoNoPasso >= T_SAT_PAUSA2) { passoSaturado = 4; tInicioPasso = agora; setRele(true); }
+          break;
+        case 4: // Liga 7 min
+          if (tempoNoPasso >= T_SAT_LIGA2)  { passoSaturado = 5; tInicioPasso = agora; setRele(false); }
+          break;
+        case 5: // Pausa 1 hora (Fica repetindo entre 4 e 5)
+          if (tempoNoPasso >= T_SAT_PAUSA3) { passoSaturado = 4; tInicioPasso = agora; setRele(true); }
+          break;
+      }
+      return; // Segura o loop aqui enquanto estiver chovendo/saturado
     }
   }
 
-  // Descanso após atingir o tempo máximo (T_MAX_ON)
+  // Cooldown normal de segurança para o motor
   if (agora < tFimCooldown) {
     if (exaustorLigado) setRele(false);
     return;
   }
 
+  // Lógica principal de exaustão de banho
   if (exaustorLigado) {
     unsigned long ligadoHa = agora - tLigouEm;
 
-    // --- NOVIDADE: Avalia se é umidade de banho ou do clima após 5 minutos ---
-    if (ligadoHa >= T_VERIFICA_QUEDA && !verificouQueda) {
-      verificouQueda = true;
-      if ((umidadeAoLigar - ultimaUmidade) < QUEDA_MINIMA) {
-        // O ar não tem pra onde secar. Grava o piso, desliga e bloqueia.
-        setRele(false);
-        bloqueioUmidade = true;
-        pisoBloqueio = ultimaUmidade;
-        return; // Retorna para iniciar o modo bloqueado
-      }
-    }
-
+    // Chegou no teto de 30 minutos contínuos
     if (ligadoHa >= T_MAX_ON) {
-      // Bateu os 30 min (exaustor rodou mas ainda está úmido -> desliga 2 min)
-      setRele(false);
-      tFimCooldown = agora + T_COOLDOWN;
+      
+      // Valida se a umidade caiu o mínimo esperado. Se não caiu, o ambiente está saturado.
+      if ((umidadeAoLigar - ultimaUmidade) < QUEDA_MINIMA) {
+        modoSaturado = true;
+        passoSaturado = 1;         // Inicia no Passo 1
+        tInicioPasso = agora;
+        pisoBloqueio = ultimaUmidade;
+        setRele(false);            // Inicia pausando 15 min
+        return;
+      } else {
+        // A umidade está caindo bem, mas precisa descansar o motor
+        setRele(false);
+        tFimCooldown = agora + T_COOLDOWN;
+      }
+      
     } else if (ligadoHa >= T_MIN_ON && ultimaUmidade <= alvo - HISTERESE) {
-      // Atingiu o alvo com folga de histerese
+      // Secou rapidamente e atingiu o alvo
       setRele(false);
     }
     
   } else {
-    // Liga o exaustor apenas se não estiver bloqueado pela umidade ambiente
-    if (ultimaUmidade >= alvo && !bloqueioUmidade) {
+    // Gatilho inicial
+    if (ultimaUmidade >= alvo && !modoSaturado) {
       setRele(true);
       tLigouEm = agora;
       umidadeAoLigar = ultimaUmidade;
-      verificouQueda = false;
     }
   }
 }
